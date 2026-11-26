@@ -18,10 +18,13 @@ import type { FC } from "react";
 
 // Always add before "Properties..."
 const spliceArtworkItem = (children: any[], appid: number) => {
-  children.find((x: any) => x?.key === "properties");
+  if (!Array.isArray(children)) return;
+  handleItemDupes(children);
   const propertiesMenuItemIdx = children.findIndex((item) =>
     findInReactTree(item, (x) => x?.onSelected?.toString().includes("AppProperties")),
   );
+  // Submenus (e.g. "Manage") have no "Properties...", so leave them alone.
+  if (propertiesMenuItemIdx === -1) return;
   children.splice(
     propertiesMenuItemIdx,
     0,
@@ -45,12 +48,16 @@ const isOpeningAppContextMenu = (items: any[]) => {
   return !!findInReactTree(items, (x) => x?.props?.onSelected?.toString().includes("launchSource"));
 };
 
+// Steam sometimes passes children as a single element, not an array.
 const handleItemDupes = (items: any[]) => {
-  const sgdbIdx = items.findIndex((x: any) => x?.key === "cheat-deck");
-  if (sgdbIdx !== -1) items.splice(sgdbIdx, 1);
+  if (!Array.isArray(items)) return;
+  for (let i = items.length - 1; i >= 0; i--) {
+    if (items[i]?.key === "cheat-deck") items.splice(i, 1);
+  }
 };
 
 const patchMenuItems = (menuItems: any[], appid: number) => {
+  if (!Array.isArray(menuItems)) return;
   let updatedAppid: number = appid;
   // find the first menu component that has the correct appid, sometimes the one passed is cached from another context menu
   const parentOverview = menuItems.find(
@@ -76,6 +83,8 @@ const patchMenuItems = (menuItems: any[], appid: number) => {
  * @returns A patch to remove when the plugin dismounts.
  */
 const contextMenuPatch = (LibraryContextMenu: any) => {
+  const nested: Patch[] = [];
+  const patchedTypes = new Set<any>();
   const patches: {
     outer?: Patch;
     inner?: Patch;
@@ -99,34 +108,41 @@ const contextMenuPatch = (LibraryContextMenu: any) => {
 
     if (!patches.inner) {
       patches.inner = afterPatch(component, "type", (_: any, ret: any) => {
+        // Steam re-renders the same menu type, so only patch each one once
+        if (patchedTypes.has(ret.type.prototype)) return ret;
+        patchedTypes.add(ret.type.prototype);
         // initial render
-        afterPatch(ret.type.prototype, "render", (_: any, ret2: any) => {
-          const menuItems = ret2.props.children[0]; // always the first child
-          if (!isOpeningAppContextMenu(menuItems)) return ret2;
-          try {
-            handleItemDupes(menuItems);
-          } catch (error) {
+        nested.push(
+          afterPatch(ret.type.prototype, "render", (_: any, ret2: any) => {
+            const menuItems = ret2.props.children[0]; // always the first child
+            if (!isOpeningAppContextMenu(menuItems)) return ret2;
+            try {
+              handleItemDupes(menuItems);
+            } catch (error) {
+              return ret2;
+            }
+            patchMenuItems(menuItems, appid);
             return ret2;
-          }
-          patchMenuItems(menuItems, appid);
-          return ret2;
-        });
+          }),
+        );
 
         // when steam decides to regresh app overview
-        afterPatch(ret.type.prototype, "shouldComponentUpdate", ([nextProps]: any, shouldUpdate: any) => {
-          try {
-            handleItemDupes(nextProps.children);
-          } catch (error) {
-            // wrong context menu (probably)
+        nested.push(
+          afterPatch(ret.type.prototype, "shouldComponentUpdate", ([nextProps]: any, shouldUpdate: any) => {
+            try {
+              handleItemDupes(nextProps.children);
+            } catch (error) {
+              // wrong context menu (probably)
+              return shouldUpdate;
+            }
+
+            if (shouldUpdate === true) {
+              patchMenuItems(nextProps.children, appid);
+            }
+
             return shouldUpdate;
-          }
-
-          if (shouldUpdate === true) {
-            patchMenuItems(nextProps.children, appid);
-          }
-
-          return shouldUpdate;
-        });
+          }),
+        );
         return ret;
       });
     } else {
@@ -135,6 +151,8 @@ const contextMenuPatch = (LibraryContextMenu: any) => {
     return component;
   });
   patches.unpatch = () => {
+    for (const patch of nested.splice(0).reverse()) patch.unpatch();
+    patchedTypes.clear();
     patches.outer?.unpatch();
     patches.inner?.unpatch();
   };
